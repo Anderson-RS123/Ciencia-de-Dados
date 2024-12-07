@@ -1,0 +1,295 @@
+# Pacotes -----------------------------------------------------------------
+library(tidyverse) # manipulação de dados
+library(janitor)#limpeza de nomes dos data sets
+library(tidymodels)# gerenciamento de  aprendizado de maquina
+library(funModeling)# útil para analise exploratória básica
+tidymodels_prefer() #Resolver conflitos de comandos 
+
+
+df = read_csv("https://raw.githubusercontent.com/stedy/Machine-Learning-with-R-datasets/refs/heads/master/concrete.csv")
+  clean_names()
+# AED ---------------------------------------------------------------------
+# conhecer o basico dos dados
+df
+df_status(df) # resumo com informação básicas sobre o status dos dados
+str(df) # resumo das variáveis
+freq(data = df) # variáveis categóricas 
+profiling_num(data=df) # variáveis numéricas
+
+
+freq(data = df) # variáveis categóricas 
+
+plot_num(data=df) # variáveis numéricas
+
+
+# encontrar relações entre as variaveis
+
+df$idade <- ifelse(df$age >= 60, 1, 0)
+cross_plot(df, input = "cement", target = "idade", plot_type = "percentual") 
+correlation_table(data=df, target="cement")
+  plotar(data=df, input=c("superplastic"),  target="idade", plot_type = "histdens")
+
+library(minerva)
+library(corrplot)
+
+TI=df %>% select_if(is.numeric) %>% mine(use = 'pairwise.complete.obs')
+
+corrplot(TI$MIC,type = "lower", method="number", tl.col = "black", tl.srt = 45)
+
+# Pre Processamento -------------------------------------------------------
+
+df=df %>% mutate(across(where(~ n_distinct(.) < 10), as.factor)) 
+
+
+# Split dos dados ---------------------------------------------------------
+
+#dividir os dados entre Treino (80%) e Teste(20%), podemos usar o argumento "strata"
+# para manter a proporção de dados da nossa variável alvo nos grupos.
+split=initial_split(data = df, prop = 0.8, strata = "cement")
+
+
+df_treino= training(split) #define o dataframe de treino
+df_test= testing(split)# define o dataframe de teste, lembrando so usaremos no final.
+
+# para compara modelos e diferentes abordagens dos mesmo, escolhas de hiperparametros
+#vamos utilizar o processo de reamostragem como conjunto de validação
+
+#Vfold cross-validation
+df_cv=vfold_cv(data=df_treino,v=10,strata = "cement") #1/10 dos dados para validação
+
+#outro método é o bootstrap
+df_bs=bootstraps(data=df_treino,times=10,pool=0.1,strata = "cement") # 10% dos dados serão para validação
+
+
+# Recipes -----------------------------------------------------------------
+
+#mesmo que não seja necessário utilizar algum step do recipe
+# podemos utilizar apenas para definir quais serão as variáveis preditoras
+
+receita=df_treino %>% recipe(cement~.) #cola steps é opcional
+
+receita_02=df %>% recipe(cement~age+water+ash+superplastic) %>% #todas as variáveis 
+  step_dummy(all_factor_predictors()) %>% # variáveis categóricas codificadas (0/1)
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), num_comp = 2)
+
+# para mais informações: https://www.tmwr.org/pre-proc-table
+
+
+# Definição do modelo -----------------------------------------------------
+# use o comando 
+parsnip:::parsnip_addin()
+# lembre que alguns modelos precisam de pacotes específicos 
+
+#tune() é opcional, vc pode colocar manualmente os valores.
+linear_model <-
+  linear_reg() %>%
+  set_engine('lm')
+
+
+kknn_model <-
+  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_engine('kknn') %>%
+  set_mode('regression')
+#consulte ?nearest_neighbor para ver os parâmetros para tune
+# nem todos precisam ser ajustados, começo pelo básico.
+
+
+# definir o workflow ------------------------------------------------------
+
+#local juntamos o modelo com a receita
+
+w_flow <-
+  workflow() %>%
+  add_model(kknn_model) %>%
+  add_recipe(receita)
+
+w_flow2 <-
+  workflow() %>%
+  add_model(linear_model) %>%
+  add_recipe(receita)
+
+# Ajuste dos hiperparametros ----------------------------------------------
+
+# fique a vontade para fazer manualmente, mas podemos utilizar de maneira automática.
+
+# primeiro passo é definir a grade de parâmetros a serem testados
+
+grid_knn <-expand_grid(
+  neighbors = c(2, 3, 4, 5),
+  weight_func = c("rectangular", "triangular","biweight", "optimal")
+)
+# existem outros métodos para desenvolver o grid de parâmetros.
+
+# segundo passo é testar os parâmetros.
+
+tuned <- tune_grid(
+  w_flow,
+  resamples = df_cv,
+  grid = grid_knn,
+  metrics = metric_set(rsq, rmse)  #metric_set(roc_auc, accuracy)
+)
+
+# observar os melhores resultados
+tuned %>%
+  show_best(metric = "rsq")
+
+# seleciona o melhor
+best_params <- tuned %>%
+  select_best(metric = "rsq")
+
+# define o workflow com os melhores parâmetros
+tuned_wflow <- finalize_workflow(
+  w_flow,
+  best_params  # Parâmetros selecionados no ajuste
+)
+
+# Validação ---------------------------------------------------------------
+
+# vamos treinar o nosso modelo com o sistema de reamostragem, para termos valores
+#de validação mais próximos aos testes, evitando surpresas no teste.
+
+cv_fit = fit_resamples(tuned_wflow ,df_cv) # lembrando df_cv é nosso grupo de trino/validação
+cv_fit2 = fit_resamples(w_flow2 ,df_cv)
+# para observar as métricas.
+cv_fit %>% collect_metrics()
+cv_fit2 %>% collect_metrics()
+
+#>>>>>> Atenção <<<<<<<< caso queira comparar outros modelos ou processos, refazer os passos anteriores
+#comparando com os valores coletados nesta métrica da validação.
+
+
+# Treino Final ------------------------------------------------------------
+# caso a validação tenha dados resultados satisfatorios 
+# caso a validação tenha dados resultados satisfatórios 
+# fazer o treinamento com o conjunto de Treino total.
+
+modelo_final=fit(tuned_wflow ,df_treino)
+modelo_final2=fit(w_flow2 ,df_treino)
+
+
+
+# Resultado Final ---------------------------------------------------------
+
+#este resultado é o que vc vai apresentar no seus relatórios, TCCs, artigos...
+# definimos as métricas
+metricas=metric_set(rsq,rmse)
+
+augment(modelo_final,new_data = df_test) %>%
+  metricas(truth =cement , estimate = .pred)
+
+#Alternativa: uma vez finalizado o workflow:
+
+Final=last_fit(tuned_wflow, split = split)
+Final2=last_fit(w_flow2, split = split)
+
+collect_metrics(Final)
+collect_metrics(Final2)
+
+# Bonus: Comparação com outro modelos --------------------------------------------
+
+# podemos comparar de forma manual, ou automática.
+
+#caso optar por manual, repita os passos anteriores e compare os resultados da etapa de validação.
+
+#para automatizar
+
+# 1º >> defina diferentes recipes, caso quiser testar o impacto de diferentes variáveis de entrada por exemplo
+
+recipe_1 <- recipe(cement ~ ., data = df_treino) %>%
+  step_normalize(all_numeric_predictors())
+
+recipe_2 <- recipe(cement ~ ., data = df_treino) %>%
+  step_normalize(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors(),threshold = 0.9)
+
+recipes <- list(
+  recipe_1 = recipe_1,
+  recipe_2 = recipe_2
+)
+
+
+# 2° >> defina diferentes modelos.
+
+# Random Forest
+rf_model <- rand_forest(min_n = tune()) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+
+# redes neurais
+mlp_model <-
+  mlp(hidden_units = 5, epochs = 100) %>%
+  set_engine('nnet') %>%
+  set_mode('regression')
+
+
+# knn
+knn_model <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("regression")
+
+# criar a lista
+models <- list(
+  rf = rf_model,
+  lm = mlp_model,
+  knn = knn_model
+)
+
+
+# 3° >> vamos preparar o worflow_set:
+
+# workflow_set
+workflow <- workflow_set(
+  preproc = recipes,
+  models = models,
+  cross = TRUE
+)
+
+# workflow map, para encontar a melhor combinação
+
+resultado <- workflow_map(
+  workflow,
+  fn = "tune_bayes", # procura otimizada de hiperparametros 
+  resamples =df_cv,
+  iter =10, #quantas epatas de otimização 
+  metrics = metric_set(rmse),
+  initial=15, # pontos aleatorios de hiperparamentros inicias
+  verbose = TRUE # mostra os passos
+)
+
+# alternativo, 
+best_workflow <- workflow_map(
+  workflow,
+  fn = "tune_grid",
+  resamples = df_cv,
+  grid = 20, #definição de 20 cenarios aleatorios de hiperparametros 
+  metrics = metric_set(rsq),
+  verbose = TRUE # mostra os passos
+)
+
+# Selecionar o melhor resultado
+
+autoplot(resultado)
+
+collect_metrics(resultado)
+
+# Selecionar o melhor workflow baseado em uma métrica
+best_results <- rank_results(resultado, rank_metric = "rmse")
+
+best_workflow <- extract_workflow(resultado, id = best_results$wflow_id[1])
+
+
+melhor_resultado <- 
+  resultado %>% 
+  extract_workflow_set_result(best_results$wflow_id[1]) %>% 
+  select_best(metric = "rmse")
+melhor_resultado
+
+
+Melhor_modelo <- 
+  resultado %>% 
+  extract_workflow(best_results$wflow_id[1]) %>% 
+  finalize_workflow( melhor_resultado) %>% 
+  last_fit(split = split) # lastfit, ja faz o teste
+
+collect_metrics(Melhor_modelo) #Resultado final no teste
